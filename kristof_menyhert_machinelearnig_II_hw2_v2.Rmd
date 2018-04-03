@@ -1,0 +1,425 @@
+---
+title: "Homework Assignment 2"
+author: "Kristof Menyhert"
+date: '2018-04-03'
+output:
+  html_document:
+    df_print: paged
+  html_notebook:
+    df_print: paged
+  pdf_document: default
+subtitle: Data Science and Machine Learning 2 - CEU 2018
+---
+
+Load some packages:
+```{r, message=FALSE, warning= FALSE, error = FALSE, results = 'hide'}
+library(data.table)
+library(knitr)
+library(kableExtra)
+library(magrittr)
+library(keras)
+
+library(h2o)
+h2o.init()
+```
+
+```{r, , message=FALSE, warning= FALSE, error = FALSE, results = 'hide'}
+data <- fread("C:/Users/Chronos/OneDrive - Central European University/R/machine_learning1/hw2/no-show-data.csv")
+
+# some data cleaning
+data[, c("PatientId", "AppointmentID", "Neighbourhood") := NULL]
+setnames(data, 
+         c("No-show", 
+           "Age", 
+           "Gender",
+           "ScheduledDay", 
+           "AppointmentDay",
+           "Scholarship",
+           "Hipertension",
+           "Diabetes",
+           "Alcoholism",
+           "Handcap",
+           "SMS_received"), 
+         c("no_show", 
+           "age", 
+           "gender", 
+           "scheduled_day", 
+           "appointment_day",
+           "scholarship",
+           "hypertension",
+           "diabetes",
+           "alcoholism",
+           "handicap",
+           "sms_received"))
+
+# for binary prediction, the target variable must be a factor
+data[, no_show := factor(no_show, levels = c("Yes", "No"))]
+data[, handicap := ifelse(handicap > 0, 1, 0)]
+
+# create new variables
+data[, gender := factor(gender)]
+data[, scholarship := factor(scholarship)]
+data[, hypertension := factor(hypertension)]
+data[, alcoholism := factor(alcoholism)]
+data[, handicap := factor(handicap)]
+
+data[, scheduled_day := as.Date(scheduled_day)]
+data[, appointment_day := as.Date(appointment_day)]
+data[, days_since_scheduled := as.integer(appointment_day - scheduled_day)]
+
+# clean up a little bit
+data <- data[age %between% c(0, 95)]
+data <- data[days_since_scheduled > -1]
+data[, c("scheduled_day", "appointment_day", "sms_received") := NULL]
+```
+
+```{r, , message=FALSE, warning=FALSE, error = FALSE, results = 'hide'}
+data <- as.h2o(data)
+```
+```{r}
+h2o.nrow(data)
+```
+
+## 1) Deep learning with `h2o` (7 points)
+*Please for all models you are building, use `reproducible = TRUE` option so that conclusions that you draw are not dependent on the particular run of your models. Also, please set the same seed.*
+
+a) Create train / validation / test sets, cutting the data into 5% - 45% - 50% parts.
+```{r}
+splitted_data <- h2o.splitFrame(data, 
+                                ratios = c(0.05, 0.45), 
+                                seed = 123)
+data_train <- splitted_data[[1]]
+data_valid <- splitted_data[[2]]
+data_test <- splitted_data[[3]]
+
+#check if the split is right or not:
+h2o.nrow(data) == h2o.nrow(data_train) + h2o.nrow(data_valid) + h2o.nrow(data_test)
+```
+
+It is right.
+
+Setting up Y and Xs variables
+```{r}
+Y <- "no_show"
+X <- setdiff(names(data), c(Y, "no_show"))
+```
+
+
+b) Train a benchmark model of your choice using h2o (such as random forest, gbm or glm) and evaluate it on the validation set.
+
+I am doing a RF model for benchmarking.
+
+```{r, message=FALSE, warning=FALSE, error = FALSE, results = 'hide'}
+# random forests
+rf_params <- list(ntrees = c(300),
+                  mtries = c(2, 3, 5, 7))
+
+rf_grid <- h2o.grid(x = X, 
+                    y = Y, 
+                    training_frame = data_train, 
+                    algorithm = "randomForest", 
+                    nfolds = 5,
+                    seed = 123,
+                    hyper_params = rf_params,
+                    stopping_metric = "AUC")
+
+h2o.getGrid(grid_id = rf_grid@grid_id, sort_by = "AUC", decreasing = TRUE)
+```
+```{r}
+rf_model <- h2o.getModel(h2o.getGrid(rf_grid@grid_id)@model_ids[[1]]) #get the best model
+```
+
+Get the AUC for the validation set:
+
+```{r}
+h2o.auc(h2o.performance(rf_model, newdata = data_valid)) 
+```
+
+It is a litle bit higher than on the traingin set, but still not too much higher.
+
+c) Build deep learning models. Experiment with parameter settings regarding  
+    * network topology (varying number of layers and nodes within layers)  
+    * activation function  
+    * dropout (both hidden and input layers)  
+    * lasso, ridge regularization  
+    * early stopping (changing stopping rounds, tolerance) and number of epochs 
+    
+For all models, supply the validation_frame and use AUC as a stopping metric. 
+Present different model versions and evaluate them on the validation set. Which one performs the best? 
+
+I used the following parameters for creating models:
+(I know I could use more, but my computer is relatively slow to do that so I was experimenting with two grid search model)
+
+```{r, message=FALSE, warning=FALSE, error = FALSE, results = 'hide'}
+dl_params <- list(activation=c("TanhWithDropout","RectifierWithDropout"),
+                  hidden=list(c(20,20),c(10,10)),
+                  input_dropout_ratio=c(0,0.2),
+                  hidden_dropout_ratios=list(c(0.4,0.4),c(0.6,0.6)),
+                  l1=c(0,0.2),
+                  l2=c(0,0.2),
+                  epochs=c(8, 12),
+                  stopping_rounds=c(4,6))
+
+search_criteria <- list(strategy = "RandomDiscrete", max_models=30, max_runtime_secs = 300, seed = 1234)
+
+dl_model0 <- h2o.grid(x=X, y=Y,
+                     algorithm = "deeplearning",
+                     reproducible = TRUE,
+                     stopping_metric = "AUC",
+                     hyper_params = dl_params,
+                     training_frame = data_train,
+                     validation_frame = data_valid,
+                     seed = 123,
+                     search_criteria = search_criteria,
+                     nfolds = 5,
+                     keep_cross_validation_predictions = TRUE)
+```
+```{r}
+h2o.getGrid(grid_id = dl_model0@grid_id, sort_by = "AUC", decreasing = TRUE)
+```
+
+Next time I used 3 layers of nodes:
+
+```{r, message=FALSE, warning=FALSE, error = FALSE, results = 'hide'}
+dl_params <- list(activation=c("TanhWithDropout","RectifierWithDropout"),
+                  hidden=list(c(20,20,20),c(10,10,10)),
+                  input_dropout_ratio=c(0,0.2),
+                  hidden_dropout_ratios=list(c(0.1,0.2,0.3),c(0.3,0.3,0.3)),
+                  l1=c(0,0.1),
+                  l2=c(0,0.1),
+                  epochs=c(5),
+                  stopping_rounds=c(5))
+
+search_criteria <- list(strategy = "RandomDiscrete", max_models=30, max_runtime_secs = 300, seed = 1234)
+
+dl_model1 <- h2o.grid(x=X, y=Y,
+                     algorithm = "deeplearning",
+                     reproducible = TRUE,
+                     stopping_metric = "AUC",
+                     hyper_params = dl_params,
+                     training_frame = data_train,
+                     validation_frame = data_valid,
+                     seed = 123,
+                     search_criteria = search_criteria,
+                     nfolds = 5,
+                     keep_cross_validation_predictions = TRUE
+                     )
+```
+```{r}
+h2o.getGrid(grid_id = dl_model1@grid_id, sort_by = "AUC", decreasing = TRUE) 
+```
+
+The best model is among the Model1 these models have 3 layers. Therefore I use the best one in this model "family" for computing its performance on the test set.
+
+```{r}
+dl_model <- h2o.getModel(h2o.getGrid(dl_model1@grid_id)@model_ids[[1]])
+```
+
+
+d) How does your best model compare to the benchmark model on the test set?
+
+```{r, message=FALSE, warning=FALSE}
+# AUC on the benchmark model on the test set:
+test_set_benchmark_auc <- h2o.auc(h2o.performance(rf_model, newdata = data_test))
+
+# AUC of the best DL model on the test set:
+test_set_dl_auc <- h2o.auc(h2o.performance(dl_model, newdata = data_test))
+
+aucs <- cbind(test_set_benchmark_auc, test_set_dl_auc)
+
+kable_styling(kable(aucs, col.names = c("AUC of RF model","AUC of the DL model"), digits = 4, align = c("c")), bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+DL model has better performance, but the diference is very small.
+
+e) Evaluate the model that performs best based on the validation set on the test set.
+
+It is the same answer.
+
+## 2) Stacking with h2o (6 points)
+
+Take the same problem and data splits.
+
+a) Build at least 4 models of different families using cross validation, keeping cross validated predictions.
+
+```{r, message=FALSE, warning=FALSE, error = FALSE, results = 'hide'}
+#RF model
+simple_rf <-h2o.randomForest(y=Y, x=X,
+                          training_frame = data_train,
+                          seed=123,
+                          nfolds=5,
+                          ntrees=500,
+                          keep_cross_validation_predictions = TRUE,
+                          stopping_metric = "AUC")
+
+#GBM model
+simple_gbm <-h2o.gbm(y=Y,x=X,
+                 training_frame = data_train,
+                 seed=123,
+                 nfolds=5,
+                 keep_cross_validation_predictions = TRUE,
+                 stopping_metric = "AUC")
+
+#Logit
+simple_logit <- h2o.glm(y=Y, x=X,
+               training_frame = data_train,
+               family = "binomial",
+               link = "logit",
+               lambda = 0,
+               nfolds = 5,
+               seed = 123,
+               keep_cross_validation_predictions = TRUE)
+
+#Deep learning model: the best from the previous exercise:
+simple_dl <- dl_model
+```
+
+
+b) Evaluate validation set performance of each model.
+```{r, message=FALSE, warning=FALSE}
+rf_auc <- h2o.auc(h2o.performance(simple_rf, newdata = data_valid))
+gbm_auc <- h2o.auc(h2o.performance(simple_gbm, newdata = data_valid))
+logit_auc <- h2o.auc(h2o.performance(simple_logit, newdata = data_valid))
+dl_auc <- h2o.auc(h2o.performance(simple_dl, newdata = data_valid))
+
+simple_model_aucs <- cbind(rf_auc, gbm_auc, logit_auc, dl_auc)
+
+kable_styling(kable(simple_model_aucs, col.names = c("RF AUC","GBM AUC", "LOGIT AUC", "DL AUC"), digits = 4, align = c("c")), bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+GBM model is the best of the 4 models, but most of the results are close.
+
+c) How large are the correlations of predicted scores of the validation set produced by the base learners?
+
+It is large. Their performace is not the same but colose to each other based on AUC.
+Let't see the exact values in a correlation matrix:
+
+```{r, message=FALSE, warning=FALSE, error = FALSE, results = 'hide'}
+predictions_rf <- as.data.frame(h2o.predict(simple_rf, newdata = data_valid))$Yes
+predictions_gbm <-  as.data.frame(h2o.predict(simple_gbm, newdata = data_valid))$Yes
+predictions_logit <- as.data.frame(h2o.predict(simple_logit, newdata = data_valid))$Yes
+predictions_dl <- as.data.frame(h2o.predict(simple_dl, newdata = data_valid))$Yes
+
+cor_matrix <- stats::cor(cbind(predictions_rf, predictions_gbm, predictions_logit, predictions_dl))
+```
+
+```{r, message=FALSE, warning=FALSE, error = FALSE}
+kable_styling(kable(cor_matrix, digits = 4, align = c("c")), bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+
+```
+
+Logit model seems the most diferent one.
+
+d) Create a stacked ensemble model from the base learners. Experiment with at least two different ensembling meta learners.
+
+I used all the models from the previous exercise.
+
+```{r, message=FALSE, warning=FALSE, error = FALSE, results = 'hide'}
+ensemble_model <- h2o.stackedEnsemble(
+  x=X, y=Y,
+  training_frame = data_train,
+  base_models = list(simple_rf,
+                     simple_gbm,
+                     simple_logit,
+                     simple_dl),
+  seed=123)
+```
+
+
+e) Evaluate ensembles on validation set. Did it improve prediction?
+
+```{r}
+ensambel_auc_valid <- h2o.auc(h2o.performance(ensemble_model, newdata = data_valid))
+
+ensambel_auc_valid
+```
+
+Yes it did. It gives a litlebit higher AUC.
+
+f) Evaluate the best performing model on the test set. How does performance compare to that of the validation set?
+
+```{r}
+ensambel_auc_test <- h2o.auc(h2o.performance(ensemble_model, newdata = data_test))
+
+ensambel_auc_test
+```
+
+It is almost the same, they are cery close to each other, therefore I think I can accept my reult of the model.
+
+## 3) Fashion image classification using keras (0 points - only for fun)
+Take the “Fashion MNIST dataset” where images of fashion items are to be classified in a similar manner to what we saw with handwritten digits (see more here[https://github.com/zalandoresearch/fashion-mnist]). Images are in exactly the same format as we saw digits: 28x28 pixel grayscale images. The task is to build deep neural net models to predict image classes. The goal is to have as accurate classifier as possible: we are using accuracy as a measure of predictive power.
+
+```{r, message=FALSE, warning=FALSE}
+fashion_mnist <- dataset_fashion_mnist()
+x_train <- fashion_mnist$train$x
+y_train <- fashion_mnist$train$y
+x_test <- fashion_mnist$test$x
+y_test <- fashion_mnist$test$y
+```
+
+a) Show some example images from the data.
+```{r}
+show_image <- function(x) {
+  image(1:28, 1:28, t(x)[,nrow(x):1],col=gray((0:255)/255)) 
+}
+
+show_image(x_train[100, , ])
+```
+
+b) Train a fully connected deep network to predict items. 
+  * Normalize the data similarly to what we saw with MNIST. 
+  * Experiment with network architectures and settings (number of hidden layers, number of nodes, activation functions, etc.)  
+  * Explain what you have tried, what worked and what did not. Present a final model.  
+  * Make sure that you use enough epochs so that the validation error starts flattening out - provide a plot about the training history (`plot(history)`)
+  
+```{r}
+# reshape
+x_train <- array_reshape(x_train, c(dim(x_train)[1], 784)) 
+x_test <- array_reshape(x_test, c(dim(x_test)[1], 784)) 
+# rescale = normalizing
+x_train <- x_train / 255
+x_test <- x_test / 255
+
+# one-hot encoding of the target variable
+y_train <- to_categorical(y_train, 10)
+y_test <- to_categorical(y_test, 10)
+```
+```{r}
+model <- keras_model_sequential() 
+model %>% 
+  layer_dense(units = 128, activation = 'relu', input_shape = c(784)) %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 64, activation = 'relu') %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 32, activation = 'relu') %>%
+  layer_dense(units = 10, activation = 'softmax')
+```
+```{r}
+summary(model)
+```
+```{r}
+model %>% compile(
+  loss = 'categorical_crossentropy',
+  optimizer = optimizer_rmsprop(),
+  metrics = c('accuracy')
+)
+```
+```{r, message=FALSE, warning=FALSE}
+history <- model %>% fit(
+  x_train, y_train, 
+  epochs = 20, 
+  batch_size = 128, 
+  validation_split = 0.2
+)
+```
+
+![loss and accuracy](C:\Users\Chronos\OneDrive - Central European University\R\machine_learning2\hw2\plot1.png)
+
+c) Evaluate the model on the test set. How does test error compare to validation error?
+```{r}
+model %>% evaluate(x_test, y_test)
+```
+
+Accuracy is around: 0.8677/87%
+
+d) Try building a convolutional neural network and see if you can improve test set performance.
